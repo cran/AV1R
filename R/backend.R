@@ -9,6 +9,9 @@
 #'
 #' @return Character string: \code{"vaapi"}, \code{"vulkan"}, or \code{"cpu"}.
 #' @export
+#' @examples
+#' detect_backend()
+#' detect_backend(prefer = "cpu")
 detect_backend <- function(prefer = "auto") {
   prefer <- match.arg(prefer, c("auto", "vulkan", "vaapi", "cpu"))
   if (prefer == "cpu")    return("cpu")
@@ -59,6 +62,8 @@ detect_backend <- function(prefer = "auto") {
 #'
 #' @return Invisibly returns the active backend string.
 #' @export
+#' @examples
+#' av1r_status()
 av1r_status <- function() {
   bk <- detect_backend()
   cat("backend:", bk, "\n")
@@ -67,10 +72,15 @@ av1r_status <- function() {
 
 #' Check Vulkan AV1 availability
 #'
-#' @return \code{TRUE} if the package was compiled with Vulkan AV1 encode support.
+#' @return \code{TRUE} if the package was compiled with Vulkan AV1 encode support
+#'   and at least one device supports \code{VK_KHR_VIDEO_ENCODE_AV1}.
 #' @export
+#' @examples
+#' vulkan_available()
 vulkan_available <- function() {
-  tryCatch(.Call("R_av1r_vulkan_available", PACKAGE = "AV1R"), error = function(e) FALSE)
+  compiled <- tryCatch(isTRUE(.Call("R_av1r_vulkan_available", PACKAGE = "AV1R")),
+                       error = function(e) FALSE)
+  compiled && identical(detect_backend("vulkan"), "vulkan")
 }
 
 #' List Vulkan-capable GPU devices
@@ -78,6 +88,8 @@ vulkan_available <- function() {
 #' @return Character vector of device names. Devices supporting
 #'   \code{VK_KHR_VIDEO_ENCODE_AV1} are marked with \code{[AV1]}.
 #' @export
+#' @examples
+#' vulkan_devices()
 vulkan_devices <- function() {
   tryCatch(.Call("R_av1r_vulkan_devices", PACKAGE = "AV1R"), error = function(e) character(0))
 }

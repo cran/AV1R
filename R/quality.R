@@ -168,6 +168,7 @@
 
   ret <- suppressWarnings(system2(ffmpeg, c(
     "-y", "-i", shQuote(probe_input),
+    "-vsync", "passthrough",
     "-c:v", "libsvtav1", "-crf", as.character(crf),
     "-pix_fmt", "yuv420p", "-svtav1-params", "preset=8",
     "-an", shQuote(tmp_out)
@@ -186,7 +187,8 @@
   tryCatch({
     .Call("R_av1r_vulkan_encode",
           probe_input, tmp_out,
-          info$width, info$height, info$fps, as.integer(crf),
+          info$width, info$height, info$fps_num, info$fps_den,
+          as.integer(crf),
           PACKAGE = "AV1R")
     if (!file.exists(tmp_out)) return(NA_real_)
     measure_ssim(probe_input, tmp_out, duration = 1)
@@ -288,13 +290,18 @@ measure_ssim <- function(original, encoded, duration = NULL) {
   ffmpeg <- Sys.which("ffmpeg")
   if (nchar(ffmpeg) == 0) stop("ffmpeg not found")
 
+  # -t is an input option here: the filter below renumbers the timestamps.
   t_args <- if (!is.null(duration)) c("-t", as.character(duration)) else character(0)
 
+  # Pair frames by index, not by timestamp: for inputs without pts (AVI) the
+  # ssim filter otherwise matches frames one apart, which reads as heavy loss.
+  lavfi <- paste0("[0:v]settb=1/1000,setpts=N[e];",
+                  "[1:v]settb=1/1000,setpts=N[o];[e][o]ssim")
+
   lines <- suppressWarnings(system2(ffmpeg, c(
-    "-i", shQuote(encoded),
-    "-i", shQuote(original),
-    "-lavfi", "ssim",
-    t_args,
+    t_args, "-i", shQuote(encoded),
+    t_args, "-i", shQuote(original),
+    "-lavfi", shQuote(lavfi),
     "-f", "null", "-"
   ), stdout = TRUE, stderr = TRUE))
 

@@ -7,8 +7,12 @@
 vulkan_available()
 }
 \value{
-\code{TRUE} if the package was compiled with Vulkan AV1 encode support.
+\code{TRUE} if the package was compiled with Vulkan AV1 encode support
+  and at least one device supports \code{VK_KHR_VIDEO_ENCODE_AV1}.
 }
 \description{
 Check Vulkan AV1 availability
+}
+\examples{
+vulkan_available()
 }

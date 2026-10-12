@@ -43,13 +43,13 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
     input_size <- file.info(input)$size
   }
 
-  # Multi-page TIFF: extract pages to temp PNG sequence via magick
+  # Multi-page TIFF: extract pages to temp 16-bit TIFF sequence
   # Skip if input is already an image sequence pattern (contains %)
   is_tiff <- !is_seq && grepl("\\.tiff?$", input, ignore.case = TRUE)
   tiff_tmpdir <- NULL
   if (is_tiff) {
     tiff_tmpdir <- tempfile("av1r_tiff_")
-    input <- .tiff_to_png_sequence(input, tiff_tmpdir)
+    input <- .tiff_to_frame_sequence(input, tiff_tmpdir)
     on.exit(unlink(tiff_tmpdir, recursive = TRUE), add = TRUE)
   }
 
@@ -88,7 +88,8 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
     }
     .Call("R_av1r_vulkan_encode",
           input, output,
-          sz$width, sz$height, info$fps, as.integer(vulkan_crf),
+          sz$width, sz$height, info$fps_num, info$fps_den,
+          as.integer(vulkan_crf),
           PACKAGE = "AV1R")
   } else if (bk == "vaapi") {
     message(sprintf("AV1R [gpu/vaapi]: VAAPI AV1 encode  [crf=%d]", options$crf))
@@ -182,10 +183,13 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
 
   audio_args <- if (is_image) c("-an") else c("-c:a", "copy")
 
+  # -vsync passthrough: one output frame per input frame. Without it ffmpeg
+  # duplicates a frame for inputs without pts (AVI), shifting the video by one.
   args <- c(
     "-y",
     input_args,
     scale_args,
+    "-vsync", "passthrough",
     encode_args,
     audio_args,
     shQuote(output)
@@ -294,6 +298,7 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
     "-vaapi_device", "/dev/dri/renderD128",
     input_args,
     "-vf", vf,
+    "-vsync", "passthrough",
     "-c:v", "av1_vaapi",
     rate_args,
     audio_args,
@@ -362,17 +367,24 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
   height <- as.integer(sub("height=", "", grep("^height=", lines, value = TRUE)))
   fps_str <- sub("r_frame_rate=", "", grep("^r_frame_rate=", lines, value = TRUE))
 
-  fps <- if (length(fps_str) > 0 && grepl("/", fps_str)) {
-    parts <- strsplit(fps_str, "/")[[1]]
-    as.integer(round(as.numeric(parts[1]) / as.numeric(parts[2])))
+  # Exact rate as a fraction (e.g. 24000/1001); fps is the rounded value.
+  parts <- if (length(fps_str) > 0 && grepl("/", fps_str))
+    suppressWarnings(as.numeric(strsplit(fps_str[1], "/")[[1]])) else NA_real_
+  if (length(parts) == 2L && all(is.finite(parts)) && all(parts > 0) &&
+      all(parts == round(parts)) && all(parts < .Machine$integer.max)) {
+    fps_num <- as.integer(parts[1])
+    fps_den <- as.integer(parts[2])
   } else {
-    25L
+    fps_num <- 25L
+    fps_den <- 1L
   }
+  fps <- as.integer(round(fps_num / fps_den))
 
   if (length(width) == 0 || length(height) == 0)
     stop("Could not read video dimensions from: ", input)
 
-  list(width = width, height = height, fps = fps)
+  list(width = width, height = height, fps = fps,
+       fps_num = fps_num, fps_den = fps_den)
 }
 
 # Internal: get video codec name via ffprobe (e.g. "h264", "vp9", "av1")
@@ -450,7 +462,7 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
   stopifnot(is.numeric(crf), length(crf) == 1, crf >= 0, crf <= 63)
   crf <- as.integer(crf)
   knots_cpu    <- c( 0L,  1L,  3L,  5L,  8L, 10L, 15L, 20L, 30L, 40L, 50L, 63L)
-  knots_vulkan <- c( 1L,  2L,  2L,  3L,  5L,  7L, 11L, 15L, 30L, 40L, 50L, 63L)
+  knots_vulkan <- c( 1L,  2L,  3L,  3L,  5L,  7L, 12L, 15L, 30L, 40L, 50L, 63L)
   as.integer(round(stats::approx(knots_cpu, knots_vulkan, xout = crf, rule = 2)$y))
 }
 
@@ -460,28 +472,29 @@ convert_to_av1 <- function(input, output, options = av1r_options()) {
                        min_w = min_w, min_h = min_h)
 }
 
-# Internal: extract multi-page TIFF to PNG sequence via magick
+# Internal: extract multi-page TIFF to a sequence of 16-bit single-page TIFFs
 # Returns ffmpeg-compatible input path (printf pattern)
-.tiff_to_png_sequence <- function(tiff_path, tmpdir) {
-  if (!requireNamespace("magick", quietly = TRUE))
-    stop("Package 'magick' is required for multi-page TIFF input.\n",
-         "  Install: install.packages(\"magick\")")
+.tiff_to_frame_sequence <- function(tiff_path, tmpdir) {
+  if (!requireNamespace("tiff", quietly = TRUE))
+    stop("Package 'tiff' is required for multi-page TIFF input.\n",
+         "  Install: install.packages(\"tiff\")")
 
   dir.create(tmpdir, recursive = TRUE, showWarnings = FALSE)
 
-  img <- magick::image_read(tiff_path)
-  n <- length(img)
+  n <- nrow(.quiet_tiff(tiff::readTIFF(tiff_path, all = TRUE, payload = FALSE)))
+  if (n == 0L) stop("No images in TIFF: ", tiff_path)
   message(sprintf("AV1R: extracting %d frames from TIFF stack...", n))
 
+  # One page at a time, so the stack is never held in memory whole.
+  # readTIFF() scales samples to [0, 1]; 16-bit output keeps the precision
+  # and ffmpeg does the conversion to the encoder pixel format.
   for (i in seq_len(n)) {
-    frame <- img[i]
-    # Convert 16-bit grayscale to 8-bit sRGB for ffmpeg compatibility
-    frame <- magick::image_convert(frame, type = "TrueColor", depth = 8)
-    out_file <- file.path(tmpdir, sprintf("frame%06d.png", i))
-    magick::image_write(frame, out_file, format = "png")
+    page <- .quiet_tiff(tiff::readTIFF(tiff_path, all = i))[[1L]]
+    tiff::writeTIFF(page, file.path(tmpdir, sprintf("frame%06d.tif", i)),
+                    bits.per.sample = 16L, compression = "none")
   }
 
   # Return printf pattern for ffmpeg
-  file.path(tmpdir, "frame%06d.png")
+  file.path(tmpdir, "frame%06d.tif")
 }
 
